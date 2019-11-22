@@ -13,7 +13,6 @@ NULL
 #' @slot raw.data List of raw data matrices, one per experiment/dataset (genes by cells)
 #' @slot norm.data List of normalized matrices (genes by cells)
 #' @slot scale.data List of scaled matrices (cells by genes)
-#' @slot impute.data List of imputed matrices (genes by cells)
 #' @slot cell.data Dataframe of cell attributes across all datasets (nrows equal to total number
 #'   cells across all datasets)
 #' @slot var.genes Subset of informative genes shared across datasets to be used in matrix
@@ -45,7 +44,6 @@ liger <- methods::setClass(
     raw.data = "list",
     norm.data = "list",
     scale.data = "list",
-    impute.data = "list",
     cell.data = "data.frame",
     var.genes = "vector",
     H = "list",
@@ -385,12 +383,16 @@ normalize <- function(object) {
 #' expression across genes and cells). Selected genes are plotted in green.
 #'
 #' @param object \code{liger} object. Should have already called normalize.
-#' @param alpha.thresh Alpha threshold. Controls upper bound for expected mean gene expression
-#'   (lower threshold -> higher upper bound). (default 0.99)
 #' @param var.thresh Variance threshold. Main threshold used to identify variable genes. Genes with
 #'   expression variance greater than threshold (relative to mean) are selected.
 #'   (higher threshold -> fewer selected genes). Accepts single value or vector with separate
 #'   var.thresh for each dataset. (default 0.1)
+#' @param alpha.thresh Alpha threshold. Controls upper bound for expected mean gene expression
+#'   (lower threshold -> higher upper bound). (default 0.99)
+#' @param num.genes Number of genes to find for each dataset. Optimises the value of var.thresh
+#'   for each dataset to get this number of genes. Accepts single value or vector with same length
+#'   as number of datasets (optional, default=NULL).
+#' @param tol Tolerance to use for optimization if num.genes values passed in (default 0.0001).
 #' @param datasets.use List of datasets to include for discovery of highly variable genes. 
 #'   (default 1:length(object@raw.data))
 #' @param combine How to combine variable genes across experiments. Either "union" or "intersect".
@@ -405,6 +407,7 @@ normalize <- function(object) {
 
 #' @return \code{liger} object with var.genes slot set.
 #' @export
+#' @importFrom stats optimize
 #' @examples
 #' \dontrun{
 #' Y <- matrix(c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12), nrow = 4, byrow = T)
@@ -417,12 +420,15 @@ normalize <- function(object) {
 #' ligerex <- selectGenes(ligerex, var.thresh=0.8)
 #' }
 
-selectGenes <- function(object, alpha.thresh = 0.99, var.thresh = 0.1,
-                        datasets.use = 1:length(object@raw.data), combine = "union",
+selectGenes <- function(object, var.thresh = 0.1, alpha.thresh = 0.99, num.genes = NULL,
+                        tol = 0.0001, datasets.use = 1:length(object@raw.data), combine = "union",
                         keep.unique = F, capitalize = F, do.plot = F, cex.use = 0.3) {
   # Expand if only single var.thresh passed
   if (length(var.thresh) == 1) {
     var.thresh <- rep(var.thresh, length(object@raw.data))
+  }
+  if (length(num.genes) == 1) {
+    num.genes <- rep(num.genes, length(object@raw.data))
   }
   if (!identical(intersect(datasets.use, 1:length(object@raw.data)),datasets.use)) {
     datasets.use = intersect(datasets.use, 1:length(object@raw.data))
@@ -443,9 +449,31 @@ selectGenes <- function(object, alpha.thresh = 0.99, var.thresh = 0.1,
     alphathresh.corrected <- alpha.thresh / nrow(object@raw.data[[i]])
     genemeanupper <- gene_expr_mean + qnorm(1 - alphathresh.corrected / 2) *
       sqrt(gene_expr_mean * nolan_constant / ncol(object@raw.data[[i]]))
+    basegenelower <- log10(gene_expr_mean * nolan_constant)
+    
+    num_varGenes <- function(x, num.genes.des){
+      # This function returns the difference between the desired number of genes and
+      # the number actually obtained when thresholded on x
+      y <- length(which(gene_expr_var / nolan_constant > genemeanupper &
+                        log10(gene_expr_var) > basegenelower + x))
+      return(abs(num.genes.des - y))
+    }
+    
+    if (!is.null(num.genes)) {
+      # Optimize to find value of x which gives the desired number of genes for this dataset
+      # if very small number of genes requested, var.thresh may need to exceed 1
+      optimized <- optimize(num_varGenes, c(0, 1.5), tol = tol, 
+                            num.genes.des = num.genes[i])
+      var.thresh[i] <- optimized$minimum
+      if (optimized$objective > 1) {
+        warning(paste0("Returned number of genes for dataset ", i, " differs from requested by ",
+                       optimized$objective, ". Lower tol or alpha.thresh for better results."))
+      }
+    }
+    
     genes.new <- names(gene_expr_var)[which(gene_expr_var / nolan_constant > genemeanupper &
-                                              log10(gene_expr_var) > log10(gene_expr_mean) +
-                                              (log10(nolan_constant) + var.thresh[i]))]
+                                            log10(gene_expr_var) > basegenelower + var.thresh[i])]
+    
     if (do.plot) {
       plot(log10(gene_expr_mean), log10(gene_expr_var), cex = cex.use,
            xlab='Gene Expression Mean (log10)',
@@ -1939,6 +1967,116 @@ SNF.liger <- function(
   return(object)
 }
 
+#' Impute the query cell expression matrix
+#'
+#' Impute query features from a reference dataset using KNN.
+#'
+#' @param object \code{liger} object.
+#' @param knn_k The maximum number of nearest neighbors to search.
+#'  The default value is set to 50.
+#' @param reference Name of the reference data
+#' @param queries Names of the query data. The default value is 'all',
+#'  but can also pass in a list of the names of the query datasets
+#' @param weight Use KNN distances as weight matrix (default FALSE)
+#' @param norm Whether normalize the imputed data with default parameters (default TRUE)
+#' @param scale Whether scale but not center the imputed data with default parameters (default TRUE)
+#'
+#' @return \code{liger} object with raw data in raw.data slot replaced by imputed data (genes by cells)
+#' @export
+#' @importFrom FNN get.knnx
+#' @examples
+#' \dontrun{
+#' Y <- matrix(c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12), nrow = 4, byrow = T)
+#' Z <- matrix(c(1, 2, 3, 4, 5, 6, 7, 6, 5, 4, 3, 2), nrow = 4, byrow = T)
+#' X <- matrix(c(1, 2, 3, 4, 5, 6, 7, 2, 3, 4, 5, 6), nrow = 4, byrow = T)
+#' ligerex <- createLiger(list(y_set = Y, z_set = Z, x_set = X))
+#' ligerex <- normalize(ligerex)
+#' # select genes
+#' ligerex <- selectGenes(ligerex)
+#' ligerex <- scaleNotCenter(ligerex)
+#' ligerex <- optimizeALS(ligerex, k = 20)
+#' ligerex <- quantileAlignSNF(ligerex)
+#' # impute every dataset other than the reference dataset
+#' ligerex <- imputeKNN(ligerex, reference = "y_set", weight = TRUE)
+#' # impute only z_set dataset
+#' ligerex <- imputeKNN(ligerex, reference = "y_set", queries = list("z_set"), weight = TRUE)
+#' }
+#'
+imputeKNN <- function(object, reference, queries = NULL, knn_k = 50, weight = FALSE, norm = TRUE, scale = TRUE) {
+  cat("Warning:\nThis function will discard the raw data previously stored in the liger object and replace the raw.data slot with the imputed data.\n\n")
+  if (length(reference) > 1) {
+    stop("Invalid reference dataset: Can only have ONE reference dataset")
+  }
+  if (is.null(queries)) { # all datasets
+    queries <- names(object@raw.data)
+    queries <- as.list(queries[!queries %in% reference])
+    cat(
+      "Imputing ALL the datasets except the reference dataset\n",
+      "Reference dataset:\n",
+      paste("  ", reference, "\n"),
+      "Query datasets:\n",
+      paste("  ", as.character(queries), "\n")
+      )
+  }
+  else { # only given query datasets
+    queries <- as.list(queries)
+    if (reference %in% queries) {
+      stop("Invalid query datasets: Reference dataset CANNOT be inclued in the query datasets")
+    }
+    else {
+      cat(
+        "Imputing given query datasets\n",
+        "Reference dataset:\n",
+        paste("  ", reference, "\n"),
+        "Query datasets:\n",
+        paste("  ", as.character(queries), "\n")
+        )
+    }
+    }
+  
+  reference_cells <- rownames(object@scale.data[[reference]]) # cells by genes
+  for (query in queries) {
+    query_cells <- rownames(object@scale.data[[query]])
+    # find nearest neighbors for query cell in normed ref datasets
+    nn.k <- get.knnx(object@H.norm[reference_cells, ], object@H.norm[query_cells, ], k = knn_k, algorithm = "CR")
+    imputed_vals <- sapply(1:nrow(nn.k$nn.index), function(n) { # for each cell in the target dataset:
+      weights <- nn.k$nn.dist[n, ]
+      weights <- as.matrix(exp(-weights) / sum(exp(-weights)))
+      imp <- object@raw.data[[reference]][, nn.k$nn.index[n, ]] # genes by cells, genes are from reference dataset
+      if (weight) {
+        imp <- as.matrix(imp %*% weights) # (genes by k) multiply by the weight matrix (k by 1)
+      }
+      else {
+        imp <- as.matrix(rowMeans(imp)) # simply count the rowmeans
+      }
+      return(imp)
+    })
+    colnames(imputed_vals) <- query_cells
+    rownames(imputed_vals) <- rownames(object@raw.data[[reference]])
+    # formatiing the matrix
+    if (class(object@raw.data[[reference]])[1] == "dgTMatrix" |
+        class(object@raw.data[[reference]])[1] == "dgCMatrix") {
+      imputed_vals <- as(imputed_vals, "dgCMatrix")
+    } else {
+      imputed_vals <- as.matrix(imputed_vals)
+    }
+    
+    object@raw.data[[query]] <- imputed_vals
+  }
+  
+  if (norm) {
+    cat('\nNormalizing data...\n')
+    object <- normalize(object)
+  }
+  if (scale) {
+    cat('Scaling (but not centering) data...')
+    object <- scaleNotCenter(object)
+  }
+  
+  return(object)
+  }
+
+
 #######################################################################################
 #### Dimensionality Reduction
 
@@ -3227,6 +3365,8 @@ plotGeneViolin <- function(object, gene, methylation.indices = NULL,
 #'   (default FALSE).
 #' @param scale.by Grouping of cells by which to scale gene (can be any factor column in cell.data
 #'   or 'none' for scaling across all cells) (default 'dataset').
+#' @param log2scale Whether to show log2 transformed values or original normalized, raw, or scaled 
+#'   values (as stored in object). Default value is FALSE if use.raw = T, otherwise TRUE.
 #' @param methylation.indices Indices of datasets in object with methylation data (this data is not
 #'   log transformed and must use normalized values). (default NULL)
 #' @param plot.by How to group cells for plotting (can be any factor column in cell.data or 'none' 
@@ -3257,6 +3397,7 @@ plotGeneViolin <- function(object, gene, methylation.indices = NULL,
 #' @return If returning single plot, returns ggplot object; if returning multiple plots; returns
 #'   list of ggplot objects.
 #' @export
+#' @importFrom dplyr %>% group_by mutate_at vars group_cols
 #' @importFrom ggplot2 ggplot geom_point aes_string element_blank ggtitle labs 
 #' scale_color_viridis_c scale_color_gradientn theme
 #' @importFrom stats quantile
@@ -3270,50 +3411,53 @@ plotGeneViolin <- function(object, gene, methylation.indices = NULL,
 #' }
 
 plotGene <- function(object, gene, use.raw = F, use.scaled = F, scale.by = 'dataset', 
-                     methylation.indices = NULL, plot.by = 'dataset', set.dr.lims = F, 
-                     pt.size = 0.1, min.clip = NULL, max.clip = NULL, clip.absolute = F, 
-                     points.only = F, option = 'plasma', cols.use = NULL, zero.color = '#F5F5F5', 
-                     axis.labels = NULL, do.legend = T, return.plots = F) {
+                     log2scale = NULL, methylation.indices = NULL, plot.by = 'dataset', 
+                     set.dr.lims = F, pt.size = 0.1, min.clip = NULL, max.clip = NULL, 
+                     clip.absolute = F, points.only = F, option = 'plasma', cols.use = NULL, 
+                     zero.color = '#F5F5F5', axis.labels = NULL, do.legend = T, return.plots = F) {
   if ((plot.by != scale.by) & (use.scaled)) {
     warning("Provided values for plot.by and scale.by do not match; results may not be very
             interpretable.")
   }
   if (use.raw) {
+    if (is.null(log2scale)) {
+      log2scale <- FALSE
+    }
     # drop only outer level names
-    gene_vals <- getGeneValues(object@raw.data, gene)
+    gene_vals <- getGeneValues(object@raw.data, gene, log2scale = log2scale)
   } else {
+    if (is.null(log2scale)) {
+      log2scale <- TRUE
+    }
+    # rescale in case requested gene not highly variable
     if (use.scaled) {
-      if (scale.by != 'dataset') {
-        # check for feature 
-        if (!(scale.by %in% colnames(object@cell.data)) & scale.by != 'none') {
-          stop("Please select existing feature in cell.data to scale.by, or add it before calling.")
-        }
-        # have to rescale in this case 
-        gene_vals <- getGeneValues(object@norm.data, gene)
-        cellnames <- names(gene_vals)
-        # set up dataframe with groups
-        gene_df <- data.frame(gene = gene_vals)
-        if (scale.by == 'none') {
-          gene_df[['scaleby']] = 'none'
-        } else {
-          gene_df[['scaleby']] = factor(object@cell.data[[scale.by]])
-        }
-        # using dplyr
-        gene_df1 <- gene_df %>%
-          group_by(scaleby) %>%
-          # scale by selected feature
-          mutate_at(vars(-group_cols()), function(x) { scale(x, center = F)})
-        gene_vals <- gene_df1$gene
-        names(gene_vals) <- cellnames
+      # check for feature 
+      if (!(scale.by %in% colnames(object@cell.data)) & scale.by != 'none') {
+        stop("Please select existing feature in cell.data to scale.by, or add it before calling.")
+      }
+      gene_vals <- getGeneValues(object@norm.data, gene)
+      cellnames <- names(gene_vals)
+      # set up dataframe with groups
+      gene_df <- data.frame(gene = gene_vals)
+      if (scale.by == 'none') {
+        gene_df[['scaleby']] = 'none'
       } else {
-        # remember to use cols instead
-        gene_vals <- getGeneValues(object@scale.data, gene, use.cols = T, log2scale = T)
+        gene_df[['scaleby']] = factor(object@cell.data[[scale.by]])
+      }
+      gene_df1 <- gene_df %>%
+        group_by(scaleby) %>%
+        # scale by selected feature
+        mutate_at(vars(-group_cols()), function(x) { scale(x, center = F)})
+      gene_vals <- gene_df1$gene
+      names(gene_vals) <- cellnames
+      if (log2scale) {
+        gene_vals <- log2(10000 * gene_vals + 1)
       }
     } else {
       # using normalized data
       # indicate methylation indices here 
       gene_vals <- getGeneValues(object@norm.data, gene, methylation.indices = methylation.indices,
-                                 log2scale = T)
+                                 log2scale = log2scale)
     }
   }
   gene_vals[gene_vals == 0] <- NA
@@ -4470,50 +4614,3 @@ convertOldLiger = function(object, override.raw = F) {
   print(paste0('New slots not filled: ', setdiff(slots_new[slots_new != "cell.data"], slots)))
   return(new.liger)
 }
-
-#' Impute the query cell expression matrix
-#'
-#' Impute query features from a reference dataset using KNN.
-#'
-#' @param object \code{liger} object. 
-#' @param knn_k The maximum number of nearest neighbors to search. The default value is set to 50.
-#' @param reference Name of the reference data
-#' @param query Name of the query data
-#' @param weight Use KNN distances as weight matrix (default FALSE)
-#'
-#' @return \code{liger} object with impute.data slot set.
-#' @export
-#' @import FNN
-#' @examples
-#' \dontrun{
-#' Y <- matrix(c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12), nrow = 4, byrow = T)
-#' Z <- matrix(c(1, 2, 3, 4, 5, 6, 7, 6, 5, 4, 3, 2), nrow = 4, byrow = T)
-#' ligerex <- createLiger(list(y_set = Y, z_set = Z))
-#' ligerex <- normalize(ligerex)
-#' # select genes
-#' ligerex <- selectGenes(ligerex)
-#' ligerex <- scaleNotCenter(ligerex)
-#' ligerex <- imputateKNN('y_set', 'z_set', weight = TRUE)
-#' }
-
-imputateKNN <- function(object, knn_k = 50, reference, query, weight = FALSE) {
-  reference_cells = rownames(object@scale.data[[reference]]) #genes x cells 
-  query_cells = rownames(object@scale.data[[query]])
-  
-  nn.k = get.knnx(object@H.norm[reference_cells,],object@H.norm[query_cells,],k=knn_k) #find nearest neighbors for query cell in H space
-  imputed_vals = sapply(1:nrow(nn.k$nn.index),function(n){ # for each cell in the taeget dataset:
-    weights = nn.k$nn.dist[n,]
-    weights = weights/sum(weights)
-    imp = object@raw.data[[reference]][,nn.k$nn.index[n,]]
-    if (weight) {
-       imp = imp*t(weight) #multiply by the weight matrix
-    }
-    else {
-       imp = rowMeans(imp) #simply get count the rowmeans
-    }
-    return(imp)
-  })
-  object@impute.data[[query]] = imputed_vals
-  return(object)
-}
-
